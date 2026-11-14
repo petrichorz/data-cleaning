@@ -1,27 +1,74 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-destination=${1:-/efs-mi-east4-4/EmbodiedDatasets/openwam/RoboCOIN/}
-[[ -d $destination ]] || { printf '目录不存在：%s\n' "$destination" >&2; exit 1; }
+# 取消注释本批次要处理的文件名前缀，可同时选择多个；区分大小写。
+prefixes=(
+    # "AI2_Alphabot_2_"
+    # "AIRBOT_MMK2_"
+    # "AgiBot-g1_"
+    # "Agilex_Cobot_Magic_"
+    # "Agilex_Split_Aloha_"
+    # "Airbot_MMK2_"
+    # "G1edu-u3_"
+    # "Galaxea_R1_Lite_"
+    # "Galbot_g1_"
+    # "R1_Lite_"
+    # "RMC-AIDA-L_"
+    # "Realman_RMC_AIDA_L_"
+    # "Tianqin_A2_"
+    # "alpha_bot_2_"
+    # "leju_robot_"
+)
+[[ ${#prefixes[@]} -gt 0 ]] || { printf '请先在脚本 prefixes 数组中填写本批次前缀。\n' >&2; exit 1; }
 
-# Snapshot the archive list before extraction; never extract several at once.
+destination=${1:-/efs-mi-east4-4/EmbodiedDatasets/openwam/RoboCOIN/}
+jobs=${EXTRACT_JOBS:-4}
+delete_archives=${DELETE_ARCHIVES:-0}
+[[ -d $destination ]] || { printf '目录不存在：%s\n' "$destination" >&2; exit 1; }
+[[ $jobs =~ ^[1-9][0-9]*$ ]] || { printf 'EXTRACT_JOBS 必须为正整数\n' >&2; exit 1; }
+[[ $delete_archives == 0 || $delete_archives == 1 ]] || { printf 'DELETE_ARCHIVES 必须为 0 或 1\n' >&2; exit 1; }
+
+# Snapshot the input list so newly extracted archives are not added to this run.
 archive_list=$(mktemp)
 trap 'rm -f -- "$archive_list"' EXIT
-find "$destination" -type f -name '*.tar.gz' -print0 > "$archive_list"
+find "$destination" -type f -name '*.tar.gz' -print0 |
+    while IFS= read -r -d '' archive; do
+        for prefix in "${prefixes[@]}"; do
+            if [[ -n $prefix && ${archive##*/} == "$prefix"* ]]; then
+                printf '%s\0' "$archive"
+                break
+            fi
+        done
+    done > "$archive_list"
 
-while IFS= read -r -d '' archive; do
+# Workers only extract; optional deletion happens after all workers succeed.
+if ! xargs -0 -r -n 1 -P "$jobs" bash -c '
+    set -euo pipefail
+    archive=$1
     parent=$(dirname -- "$archive")
 
-    # Keep existing files intact. Any collision or extraction error preserves
-    # the archive and stops the script; partial output is retained for inspection.
-    if ! tar --extract --gzip --keep-old-files --no-same-owner \
+    # Skip existing files, including shared files repeated across archives.
+    # Existing files must already be complete; tar does not compare their content.
+    if ! tar --extract --gzip --skip-old-files --no-same-owner \
         --file="$archive" --directory="$parent"; then
-        printf '解压失败，已停止并保留压缩包：%s\n' "$archive" >&2
+        printf "解压失败，保留压缩包：%s\n" "$archive" >&2
         exit 1
     fi
 
-    # Flush extracted data before deleting this archive. No batch deletion.
-    sync -f "$parent"
-    rm -- "$archive"
-    printf '解压完成，已删除压缩包：%s\n' "$archive"
-done < "$archive_list"
+    printf "解压完成：%s\n" "$archive"
+' _ < "$archive_list"; then
+    printf '部分压缩包解压失败，请检查上方报错；所有压缩包均保留。\n' >&2
+    exit 1
+fi
+
+if [[ $delete_archives == 1 && -s $archive_list ]]; then
+    # Flush the destination filesystem before deleting the original input list.
+    # A failed extraction or sync exits before any archive is deleted.
+    sync -f "$destination"
+    while IFS= read -r -d '' archive; do
+        rm -- "$archive"
+        printf '已删除压缩包：%s\n' "$archive"
+    done < "$archive_list"
+else
+    printf '解压流程结束，压缩包已保留。\n'
+fi
