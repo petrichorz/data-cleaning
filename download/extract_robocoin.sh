@@ -41,7 +41,29 @@ find "$destination" -type f -name '*.tar.gz' -print0 |
         done
     done > "$archive_list"
 
+total=$(tr -cd '\000' < "$archive_list" | wc -c)
+if [[ $total -eq 0 ]]; then
+    printf '没有匹配当前前缀的压缩包。\n'
+    exit 0
+fi
+
+show_progress() {
+    local completed=$1 failed=$2 filled bar empty
+    filled=$((completed * 30 / total))
+    printf -v bar '%*s' "$filled" ''
+    printf -v empty '%*s' "$((30 - filled))" ''
+    [[ ! -t 1 ]] || printf '\r'
+    printf '[%s%s] %3d%% 完成 %d/%d 失败 %d' \
+        "${bar// /#}" "${empty// /-}" "$((completed * 100 / total))" \
+        "$completed" "$total" "$failed"
+    if [[ ! -t 1 || $completed -eq $total ]]; then
+        printf '\n'
+    fi
+}
+show_progress 0 0
+
 # Workers only extract; optional deletion happens after all workers succeed.
+# Workers emit one status line; a single reader updates the progress counter.
 if ! xargs -0 -r -n 1 -P "$jobs" bash -c '
     set -euo pipefail
     archive=$1
@@ -49,14 +71,25 @@ if ! xargs -0 -r -n 1 -P "$jobs" bash -c '
 
     # Skip existing files, including shared files repeated across archives.
     # Existing files must already be complete; tar does not compare their content.
+    status=0
     if ! tar --extract --gzip --skip-old-files --no-same-owner \
-        --file="$archive" --directory="$parent"; then
-        printf "解压失败，保留压缩包：%s\n" "$archive" >&2
-        exit 1
+        --file="$archive" --directory="$parent" >&2; then
+        printf "\n解压失败，保留压缩包：%s\n" "$archive" >&2
+        status=1
     fi
 
-    printf "解压完成：%s\n" "$archive"
-' _ < "$archive_list"; then
+    printf "%s\n" "$status"
+    exit "$status"
+' _ < "$archive_list" | (
+    completed=0
+    failed=0
+    while IFS= read -r status; do
+        completed=$((completed + 1))
+        failed=$((failed + status))
+        show_progress "$completed" "$failed"
+    done
+); then
+    [[ ! -t 1 ]] || printf '\n'
     printf '部分压缩包解压失败，请检查上方报错；所有压缩包均保留。\n' >&2
     exit 1
 fi
