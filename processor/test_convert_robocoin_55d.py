@@ -63,26 +63,74 @@ class ConvertTests(unittest.TestCase):
         original = pa.Table.from_pylist([row])
         self.assertTrue(result.select(original.column_names).equals(original))
 
-    def test_nonfinite_any_source_zeros_whole_row_and_continues(self):
-        info, good, _ = fixture(hand_count=12)
-        cases = [("observation.state", -1, np.nan),  # unnamed component
-                 ("action", 0, np.inf),  # excluded >6-channel hand
-                 ("eef_sim_pose_state", 3, -np.inf),
-                 ("eef_sim_pose_action", 6, np.nan),
-                 ("gripper_open_scale_state", 1, np.inf),
-                 ("gripper_open_scale_action", 0, np.nan)]
-        for column, index, value in cases:
-            with self.subTest(column=column):
-                bad_row = copy.deepcopy(good)
-                bad_row[column][index] = value
-                _, arrays, bad, logs = self.convert(info, [good, bad_row, good])
-                self.assertEqual(bad, 1)
+    def test_nonfinite_masks_only_affected_components(self):
+        info, good, _ = fixture()
+        _, baseline, _, _ = self.convert(info, [good])
+        state_names = info["features"]["observation.state"]["names"]
+        action_names = info["features"]["action"]["names"]
+        cases = [("observation.state", state_names.index("left_arm_joint_2_rad"), np.nan, "state", [1]),
+                 ("action", action_names.index("right_hand_joint_3_rad"), np.inf, "action", [38]),
+                 ("eef_sim_pose_state", 3, -np.inf, "state", list(range(17, 21))),
+                 ("eef_sim_pose_action", 10, np.nan, "action", list(range(24, 28))),
+                 ("eef_sim_pose_action", 6, np.nan, "action", [21]),
+                 ("gripper_open_scale_state", 1, np.inf, "state", [29]),
+                 ("gripper_open_scale_action", 0, np.nan, "action", [28]),
+                 ("gripper_open_scale_action", 0, 1e100, "action", [28]),
+                 ("observation.state", state_names.index("left_hand_joint_1_rad"), None, "state", [30])]
+        for column, index, value, kind, slots in cases:
+            with self.subTest(column=column, index=index, value=value):
+                row = copy.deepcopy(good)
+                row[column][index] = value
+                _, arrays, zeroed, logs = self.convert(info, [good, row, good])
+                self.assertEqual(zeroed, 0)
                 self.assertEqual(logs[0]["source_row"], 11)
                 self.assertEqual(logs[0]["field"], column)
-                for a in arrays.values():
-                    self.assertTrue((a[1] == 0).all())
-                    np.testing.assert_array_equal(a[0], a[2])
-                self.assertTrue((arrays["mask_state"][:, 30:42] == 0).all())
+                self.assertEqual(logs[0]["result"], "components_masked")
+                self.assertEqual(logs[0]["masked_" + kind + "_indices"], slots)
+                for name, array in arrays.items():
+                    expected = baseline[name][0].copy()
+                    if name in (kind + "_unified", "mask_" + kind):
+                        expected[slots] = 0
+                    np.testing.assert_array_equal(array[1], expected)
+                    np.testing.assert_array_equal(array[0], baseline[name][0])
+                    np.testing.assert_array_equal(array[2], baseline[name][0])
+
+    def test_unmapped_nonfinite_is_logged_without_changing_55d(self):
+        info, good, _ = fixture(hand_count=12)
+        _, baseline, _, _ = self.convert(info, [good])
+        for column, index in (("observation.state", -1), ("action", 0)):
+            row = copy.deepcopy(good)
+            row[column][index] = np.nan
+            _, arrays, zeroed, logs = self.convert(info, [row])
+            self.assertEqual(zeroed, 0)
+            self.assertEqual(logs[0]["result"], "source_only")
+            for name in arrays:
+                np.testing.assert_array_equal(arrays[name], baseline[name])
+
+    def test_quaternion_conversion_failure_is_local(self):
+        info, row, _ = fixture()
+        from scipy.spatial.transform import Rotation
+        real = Rotation.from_euler
+        calls = 0
+
+        def fail_first(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise ValueError("simulated quaternion failure")
+            return real(*args, **kwargs)
+
+        _, baseline, _, _ = self.convert(info, [row])
+        with patch("convert_robocoin_55d.Rotation") as rotation:
+            rotation.from_euler.side_effect = fail_first
+            _, arrays, zeroed, logs = self.convert(info, [row])
+        self.assertEqual(zeroed, 0)
+        self.assertEqual(logs[0]["error_type"], "conversion_failed")
+        for name in arrays:
+            expected = baseline[name].copy()
+            if name in ("state_unified", "mask_state"):
+                expected[:, 17:21] = 0
+            np.testing.assert_array_equal(arrays[name], expected)
 
     def test_missing_gripper_and_mismatched_hand_names(self):
         info, row, _ = fixture()
@@ -97,12 +145,12 @@ class ConvertTests(unittest.TestCase):
         self.assertTrue((arrays["mask_state"][0, 36:42] == 1).all())
         self.assertTrue((arrays["mask_state"][0, 14:28] == 1).all())
 
-    def test_bad_row_shape_null_and_float32_overflow(self):
+    def test_structural_errors_still_zero_whole_row(self):
         info, good, _ = fixture()
         for column, value in (("eef_sim_pose_action", [0.] * 11),
                               ("eef_sim_pose_state", None),
-                              ("action", [None] * len(good["action"])),
-                              ("gripper_open_scale_action", [1e100, 0.])):
+                              ("action", [0.]),
+                              ("gripper_open_scale_action", [0.])):
             with self.subTest(column=column, value=str(value)[:20]):
                 row = copy.deepcopy(good)
                 row[column] = value
@@ -123,7 +171,7 @@ class ConvertTests(unittest.TestCase):
     def test_disk_roundtrip_metadata_and_error_log(self):
         info, row, _ = fixture()
         bad = copy.deepcopy(row)
-        bad["action"][-1] = np.nan
+        bad["gripper_open_scale_action"][1] = np.nan
         original = pa.Table.from_pylist([row, bad, row])
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory) / "source"
@@ -139,7 +187,9 @@ class ConvertTests(unittest.TestCase):
             original_schema = pq.read_schema(data)
             summary = convert_dataset(source, batch_size=2)
             self.assertEqual(summary["status"], "complete_with_errors")
-            self.assertEqual(summary["zeroed_rows"], 1)
+            self.assertEqual(summary["zeroed_rows"], 0)
+            self.assertEqual(summary["error_rows"], 1)
+            self.assertEqual(summary["masked_rows"], 1)
             result = pq.read_table(data)
             self.assertEqual(list((source / "data").rglob("*.parquet")), [data])
             self.assertFalse(list(source.rglob("*.tmp")))
@@ -160,7 +210,8 @@ class ConvertTests(unittest.TestCase):
             log = [json.loads(s) for s in log_path.read_text().splitlines()]
             self.assertEqual(len(log), 1)
             self.assertEqual(log[0]["source_row"], 1)
-            self.assertEqual(log[0]["result"], "row_zeroed")
+            self.assertEqual(log[0]["result"], "components_masked")
+            self.assertEqual(log[0]["masked_action_indices"], [29])
             self.assertEqual((source / "videos/keep.mp4").read_bytes(), b"video unchanged")
             self.assertEqual((source / "meta/keep.txt").read_text(), "original metadata")
             # 重跑不重复追加列，结果一致；错误报告只保留本轮，避免重复累计。

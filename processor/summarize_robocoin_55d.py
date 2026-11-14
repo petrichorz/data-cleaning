@@ -39,8 +39,11 @@ def main():
             if status not in ("complete", "complete_with_errors"):
                 incomplete = True
                 reasons.append(f"转换状态为 {status}")
-            if status == "complete_with_errors" or errors or zeroed:
-                reasons.append(f"转换错误 {errors} 条，整行置零 {zeroed} 行")
+            masked = summary.get("masked_rows", 0)  # 兼容之前仅有 zeroed_rows 的报告。
+            if type(masked) is not int or masked < 0:
+                raise ValueError("摘要的 masked_rows 计数无效")
+            if status == "complete_with_errors" or errors or zeroed or masked:
+                reasons.append(f"转换错误 {errors} 条，部分维度屏蔽 {masked} 行，整行置零 {zeroed} 行")
         except (OSError, ValueError) as exc:
             incomplete = True
             reasons.append(f"摘要缺失或无法读取：{exc}")

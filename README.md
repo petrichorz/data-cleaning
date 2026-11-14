@@ -3,16 +3,19 @@
 
 ## 转换规则文档
 
-[OpenWAM RoboCOIN → 55D 语义映射规则](doc/robocoin_55d_mapping.md)：记录双臂关节、EEF、夹爪、灵巧手映射，腰/头/底盘不接入的规则，保留原始逐帧对应关系的转换流程，以及后续待讨论项。
+[OpenWAM RoboCOIN → 55D 语义映射规则](doc/robocoin_55d_mapping.md)：记录双臂关节、EEF、夹爪、灵巧手映射，腰/头/底盘不接入的规则，整集动作判定与下一帧目标规则，以及后续质检项。
 
-[后处理质检讨论记录](doc/robocoin_postprocess_qc.md)：保留 action/state 相等检查与下一帧目标的候选方案，独立于当前 55D 转换，暂不执行。
+[后处理质检讨论记录](doc/robocoin_postprocess_qc.md)：记录已确认的 action/state 整集检查、运动门槛与下一帧目标规则，现已接入转换流程。
 
 ## RoboCOIN 转 55D
 
 脚本：[processor/convert_robocoin_55d.py](processor/convert_robocoin_55d.py)。
-仅做已确定的字段映射，新增 `state_unified`、`action_unified`、`mask_state`、`mask_action`，
-均为长度 55 的 float32 数组。state/action 保持原来的逐帧对应关系，不做单位换算、
-训练归一化、下一帧替换或四元数符号调整。
+按已确定的字段映射，新增 `state_unified`、`action_unified`、`mask_state`、`mask_action`，
+均为长度 55 的 float32 数组。先按原始行映射，再按完整 episode 沿用同事的动作策略：
+映射来源和原始同名分量（含未接入的手指）全程严格相等、语义和 mask 一致、至少 3 帧，
+且臂关节或夹爪有超过 `1e-6` 的相邻帧变化，才令派生 `action[t]=state[t+1]`，mask 同步移动，
+末帧派生 action/mask 清零。任一条件不满足就保留初步转换结果，不局部移动夹爪或 EEF。
+不做单位换算、训练归一化或四元数符号调整，原始列保持原样。
 
 在仓库根目录安装依赖并运行：
 
@@ -33,7 +36,11 @@ python processor/convert_robocoin_55d.py \
 
 输入也可以直接指向一个子数据集。脚本直接给原来的 `data/*.parquet` 增加四列，
 不再需要 `--output`，也不另外保存一份数据集。
-逐批读取 Parquet，默认每批 4096 行，可用 `--batch-size` 调整。默认顺序处理，不启动并行任务。
+按 `episode_index` 跨文件汇集完整 episode，按 `frame_index` 判断先后，再按原文件行位置写回。
+帧号缺失、重复或不连续时不移位，原因记录在 QC 中。`--batch-size` 默认 4096，只控制写回时
+读取原文件和写 Parquet 的批次行数，不控制 episode 判定范围。默认顺序处理子数据集。
+临时新增列使用磁盘暂存（每帧约 880 字节），不把所有 55D 数组常驻内存；
+内存主要用于行位置索引、一个原始 row group 和一个完整 episode。
 
 输出内容：
 
@@ -41,23 +48,28 @@ python processor/convert_robocoin_55d.py \
 - `meta/info.json`：所有文件处理成功后，在原文件的 `features` 中登记新增四列；原有字段定义和其他元数据保留，不生成新训练统计。
 - `videos/`：保持原样。
 - `qc/conversion_errors.jsonl`：所有转换错误，含文件、行号、episode、帧号、字段/索引和处理结果。
-- `qc/conversion_summary.json`：转换行数、置零行数、错误数、关节映射和未接入手部的原因。
+- `qc/conversion_summary.json`：转换行数、错误行数、局部屏蔽行数、整行置零行数、错误数、关节映射和未接入手部的原因；另有 `episodes`、`shifted_episodes`、`retained_episodes` 及判定原因计数。
+- `qc/episode_policy.jsonl`：每个 episode 的来源文件、处理模式、原因；移位时记录末帧帧号。报告计数表示已完成判断，是否全部写回以转换 `status` 为准。
 
-原始 state/action、EEF、夹爪来源中的任何分量含 NaN/Inf（包括未映射、未命名分量），
-或一行数据为空、数组过短、姿态转换失败时，该行四个新增向量全部置零，记录错误后继续。
+NaN/Inf 或 null 数值元素只将对应输出维度的值和 mask 置零；state/action、左右侧独立。
+某侧任一欧拉角无效或姿态转换失败时，仅屏蔽该侧四元数四维，位置仍照常处理。
+float32 溢出也只屏蔽对应维度；未映射或未命名分量的 NaN/Inf 只记录，不影响有效槽位。
+整个必需向量缺失、长度不符等结构错误仍将该行四个新增向量全部置零，记录后继续。
 原始列中的错误数值仍保留，不删除该行。正常没有夹爪、手指超出容量等情况按映射规则补零。
 
 双臂定义不是每侧连续 6/7 个关节时，记录子数据集错误，继续下一个子数据集。
-文件读取或写入失败时，记录文件错误，继续其他文件；该子数据集标为 `incomplete`，
-失败文件保留原文件，已成功的文件保留新增列，本轮不更新 `meta/info.json`。
+完整 episode 准备阶段读取失败时，记录错误，该子数据集停止写回，避免使用不完整轨迹做判断。
+写回某个文件失败时保留该原文件，继续其他文件；子数据集标为 `incomplete`，
+已成功的文件保留新增列，本轮不更新 `meta/info.json`。
 整个子数据集不是一次性替换：中断时可能只有部分文件已增加四列，应以 `qc/` 汇总的完成状态为准。
 
 中断或失败后可直接重跑同一命令。每次都从原始列重新计算所有文件，
 已有的四个派生字段会重新生成，不重复追加；上次中断留下的临时文件会重写。
-`qc/conversion_errors.jsonl` 和 `qc/conversion_summary.json` 每次重新生成，反映本轮结果。
+三个 QC 报告每次重新生成，反映本轮结果。重复执行不会再次移动上轮的派生 action。
+正常退出会清理 `qc/.conversion-*` 临时新增列；强制终止可能留下该临时目录，确认没有任务使用后可删除，不影响重跑。
 同一个子数据集不要同时启动多个转换进程。
 
-行错误已记录并置零的子数据集标为 `complete_with_errors`，不会因此中断命令；
+有转换错误记录的子数据集标为 `complete_with_errors`，不会因此中断命令；
 任一子数据集为 `incomplete` 时命令退出码为 1，否则为 0。即使退出码为 0，也应查看 `qc/` 汇总。
 
 运行测试：
@@ -80,14 +92,14 @@ bash processor/convert_robocoin_55d.sh
 CONVERT_JOBS=8 PYTHON_BIN=/path/to/python bash processor/convert_robocoin_55d.sh /path/to/RoboCOIN
 ```
 
-每个进程转换一个子数据集，内部逐文件处理；完成一个就接着取下一个。
-`BATCH_SIZE` 可调整每批行数，默认 4096。原地追加及重跑行为与 Python 脚本一致。
+每个进程转换一个子数据集，内部按完整 episode 处理并写回原文件；完成一个就接着取下一个。
+`BATCH_SIZE` 可调整写回的 I/O 批次行数，默认 4096，不拆分 episode。原地追加及重跑行为与 Python 脚本一致。
 各子数据集的详细运行日志写到自己的 `qc/conversion.log`，每次重跑覆盖。
 
 总体进度条按子数据集数量计数，例如 `[##########--------------------] 33% 完成 5/15 失败 0`。
 完成数包含成功和失败；终端原地刷新，重定向或 `nohup` 日志中逐行输出。
 失败数统计进程返回非零的子数据集，单个失败后继续其他任务，最终返回非零退出码。
-结束后自动打印有问题的子数据集、错误数、置零行数及错误类型/字段计数，并写入
+结束后自动打印有问题的子数据集、错误数、局部屏蔽行数、整行置零行数及错误类型/字段计数，并写入
 **根目录的 `qc/conversion_batch_summary.json`**，不用逐个打开子数据集报告。
 汇总包含各问题数据集的完整摘要、前三条错误示例和详细日志路径；仅统计本批次选中的目录，每次重跑覆盖。
 `complete_with_errors` 仍算已完成，但会进入问题清单；单个转换失败、摘要缺失或损坏也会列入，且先汇总再返回失败码。
