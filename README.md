@@ -94,6 +94,40 @@ CONVERT_JOBS=8 PYTHON_BIN=/path/to/python bash processor/convert_robocoin_55d.sh
 没有手部字段或手指超过 6 维是正常映射规则，不单独列为错误。
 不要同时对同一个子数据集启动多个转换任务。依赖 Bash、GNU find/sort/xargs，以及 Python 转换依赖。
 
+### 只读并行检查 NaN/Inf
+
+一键启动：[processor/scan_robocoin_nonfinite.sh](processor/scan_robocoin_nonfinite.sh)。
+默认扫描此前的 RoboCOIN 根目录，4 个进程并行；顶部 `prefixes` 可选择本批次前缀，默认 15 个全部启用。
+
+```bash
+bash processor/scan_robocoin_nonfinite.sh
+
+# 可选：指定并发数、解释器、根目录，并保存异常明细和最终总计。
+SCAN_JOBS=8 PYTHON_BIN=/path/to/python bash processor/scan_robocoin_nonfinite.sh /path/to/RoboCOIN > nonfinite.jsonl
+```
+
+`BATCH_SIZE` 默认 4096；终端显示扫描进度。Bash 保留 Python 扫描器的退出码，不修改数据。
+也可以直接运行 Python：
+
+```bash
+python processor/scan_robocoin_nonfinite.py --workers 4
+
+# 可指定根目录和子数据集前缀，将结果保存为 JSONL。
+python processor/scan_robocoin_nonfinite.py /path/to/RoboCOIN \
+  --prefixes AIRBOT_MMK2_ G1edu-u3_ --workers 8 > nonfinite.jsonl
+```
+
+默认目录同并行转换 Bash。也支持传入单个子数据集目录或单个 Parquet 文件。
+默认检查原始 `observation.state`、`action`、`eef_sim_pose_state/action`、
+`gripper_open_scale_state/action` 的全部分量，包括未映射的手指和未命名分量。
+仅扫描文件中实际存在的指定列；可用 `--columns` 指定其他数值列。
+这是 NaN/Inf 扫描，不将 null 缺失值当作 NaN，也不检查有限值是否合理。
+
+每个异常帧打印一行 JSON：文件绝对路径、Parquet 内行号、`episode_index`、`frame_index`、
+出错字段、字段内分量下标和 NaN/+Inf/-Inf；下标均从 0 开始，缺少帧编号时打印 null，不推测编号。
+多个文件并行扫描，输出顺序不固定；进度写到 stderr，最后一行 stdout 为总计。
+退出码：0 无 NaN/Inf，1 发现 NaN/Inf，2 扫描不完整或参数错误。脚本不修改任何数据或 qc 文件。
+
 ## RoboCOIN 下载
 
 在已挂载目标目录的机器上，使用现有 obsutil 配置运行：
