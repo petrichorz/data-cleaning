@@ -1,6 +1,99 @@
 # data-cleaning
 数据清洗
 
+## 转换规则文档
+
+[OpenWAM RoboCOIN → 55D 语义映射规则](doc/robocoin_55d_mapping.md)：记录双臂关节、EEF、夹爪、灵巧手映射，腰/头/底盘不接入的规则，保留原始逐帧对应关系的转换流程，以及后续待讨论项。
+
+[后处理质检讨论记录](doc/robocoin_postprocess_qc.md)：保留 action/state 相等检查与下一帧目标的候选方案，独立于当前 55D 转换，暂不执行。
+
+## RoboCOIN 转 55D
+
+脚本：[processor/convert_robocoin_55d.py](processor/convert_robocoin_55d.py)。
+仅做已确定的字段映射，新增 `state_unified`、`action_unified`、`mask_state`、`mask_action`，
+均为长度 55 的 float32 数组。state/action 保持原来的逐帧对应关系，不做单位换算、
+训练归一化、下一帧替换或四元数符号调整。
+
+在仓库根目录安装依赖并运行：
+
+```bash
+python -m pip install -r processor/requirements.txt
+
+python processor/convert_robocoin_55d.py \
+  /path/to/RoboCOIN
+```
+
+可以只处理指定子数据集，名称需要完整匹配：
+
+```bash
+python processor/convert_robocoin_55d.py \
+  /path/to/RoboCOIN \
+  --datasets AIRBOT_MMK2_mobile_car leju_robot_hotel_services_ah
+```
+
+输入也可以直接指向一个子数据集。脚本直接给原来的 `data/*.parquet` 增加四列，
+不再需要 `--output`，也不另外保存一份数据集。
+逐批读取 Parquet，默认每批 4096 行，可用 `--batch-size` 调整。默认顺序处理，不启动并行任务。
+
+输出内容：
+
+- `data/`：保留原始列、行数和行顺序，追加四个 55D 字段。先写同目录临时文件，完整写完并关闭后替换原文件，最终路径和文件数量不变。
+- `meta/info.json`：所有文件处理成功后，在原文件的 `features` 中登记新增四列；原有字段定义和其他元数据保留，不生成新训练统计。
+- `videos/`：保持原样。
+- `qc/conversion_errors.jsonl`：所有转换错误，含文件、行号、episode、帧号、字段/索引和处理结果。
+- `qc/conversion_summary.json`：转换行数、置零行数、错误数、关节映射和未接入手部的原因。
+
+原始 state/action、EEF、夹爪来源中的任何分量含 NaN/Inf（包括未映射、未命名分量），
+或一行数据为空、数组过短、姿态转换失败时，该行四个新增向量全部置零，记录错误后继续。
+原始列中的错误数值仍保留，不删除该行。正常没有夹爪、手指超出容量等情况按映射规则补零。
+
+双臂定义不是每侧连续 6/7 个关节时，记录子数据集错误，继续下一个子数据集。
+文件读取或写入失败时，记录文件错误，继续其他文件；该子数据集标为 `incomplete`，
+失败文件保留原文件，已成功的文件保留新增列，本轮不更新 `meta/info.json`。
+整个子数据集不是一次性替换：中断时可能只有部分文件已增加四列，应以 `qc/` 汇总的完成状态为准。
+
+中断或失败后可直接重跑同一命令。每次都从原始列重新计算所有文件，
+已有的四个派生字段会重新生成，不重复追加；上次中断留下的临时文件会重写。
+`qc/conversion_errors.jsonl` 和 `qc/conversion_summary.json` 每次重新生成，反映本轮结果。
+同一个子数据集不要同时启动多个转换进程。
+
+行错误已记录并置零的子数据集标为 `complete_with_errors`，不会因此中断命令；
+任一子数据集为 `incomplete` 时命令退出码为 1，否则为 0。即使退出码为 0，也应查看 `qc/` 汇总。
+
+运行测试：
+
+```bash
+python -B -m unittest discover -s processor -p 'test_*.py' -v
+```
+
+### 按子数据集前缀并行转换
+
+启动脚本：[processor/convert_robocoin_55d.sh](processor/convert_robocoin_55d.sh)。
+默认根目录为 `/efs-mi-east4-4/EmbodiedDatasets/openwam/RoboCOIN/RoboCOIN/`，默认 4 并发。
+编辑脚本顶部的 `prefixes` 数组，保留本批次需要的前缀，将其他行注释掉；目前列出的 15 个前缀全部启用。
+按直接子数据集的目录名前缀匹配，区分大小写；多个前缀命中同一目录也只处理一次。
+
+```bash
+bash processor/convert_robocoin_55d.sh
+
+# 可选：改变并发数、Python 解释器或根目录。
+CONVERT_JOBS=8 PYTHON_BIN=/path/to/python bash processor/convert_robocoin_55d.sh /path/to/RoboCOIN
+```
+
+每个进程转换一个子数据集，内部逐文件处理；完成一个就接着取下一个。
+`BATCH_SIZE` 可调整每批行数，默认 4096。原地追加及重跑行为与 Python 脚本一致。
+各子数据集的详细运行日志写到自己的 `qc/conversion.log`，每次重跑覆盖。
+
+总体进度条按子数据集数量计数，例如 `[##########--------------------] 33% 完成 5/15 失败 0`。
+完成数包含成功和失败；终端原地刷新，重定向或 `nohup` 日志中逐行输出。
+失败数统计进程返回非零的子数据集，单个失败后继续其他任务，最终返回非零退出码。
+结束后自动打印有问题的子数据集、错误数、置零行数及错误类型/字段计数，并写入
+**根目录的 `qc/conversion_batch_summary.json`**，不用逐个打开子数据集报告。
+汇总包含各问题数据集的完整摘要、前三条错误示例和详细日志路径；仅统计本批次选中的目录，每次重跑覆盖。
+`complete_with_errors` 仍算已完成，但会进入问题清单；单个转换失败、摘要缺失或损坏也会列入，且先汇总再返回失败码。
+没有手部字段或手指超过 6 维是正常映射规则，不单独列为错误。
+不要同时对同一个子数据集启动多个转换任务。依赖 Bash、GNU find/sort/xargs，以及 Python 转换依赖。
+
 ## RoboCOIN 下载
 
 在已挂载目标目录的机器上，使用现有 obsutil 配置运行：
