@@ -6,6 +6,33 @@
 
 ## 使用
 
+### 按机器人前缀一键合并
+
+在 `processor/aggregate_causal_action_stats.sh` 开头的 `prefixes` 数组中选择机器人前缀，执行：
+
+```bash
+bash processor/aggregate_causal_action_stats.sh /你的统计输出目录
+```
+
+默认输入根目录是 `/efs-mi-east4-4/EmbodiedDatasets/openwam/RoboCOIN/RoboCOIN/`。
+也可以将根目录作为第二个参数。或者直接在 Bash 中填写 `output_dir`，不传参数运行。
+
+每个前缀分别调用 Python 合并脚本，输出例如：
+
+```text
+stats_robocoin_AIRBOT_MMK2.json
+stats_robocoin_Agilex_Cobot_Magic.json
+stats_robocoin_Galbot_g1.json
+```
+
+目录匹配使用完整前缀，文件名去掉前缀末尾的一个下划线；大小写保留。
+没有匹配的前缀会打印跳过，不生成文件；有子集缺少统计或统计不兼容时，该前缀失败，
+继续处理其余前缀，最后列出失败前缀并返回非零退出码。全部未匹配也返回非零退出码。
+重跑会替换成功合并的输出；失败或跳过的前缀不会更新已有文件，请以本次结束摘要判断是否成功。
+可用 `PYTHON_BIN` 指定 Python 解释器，默认使用当前环境的 `python`。
+
+### 手动合并一个来源组
+
 在 data-cleaning 目录执行，把 RoboCOIN 下所有子数据集合成一份来源统计：
 
 ```bash
