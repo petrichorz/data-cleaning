@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: OpenMDW-1.1
 """Aggregate per-dataset statistics without reading trajectories.
 
-python processor/aggregate_causal_action_stats.py --dataset-root /data/parent --output /data/stats.json
+python processor/robocoin/aggregate_causal_action_stats.py --dataset-root /data/parent --output /data/stats.json
 
 独立脚本，仅依赖 NumPy；规则来自 cosmos-framework-ascend 的同名工具。
 一个调用合并一个来源组，由输入目录及可选前缀决定组成员，不自动猜机型。

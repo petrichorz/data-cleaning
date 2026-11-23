@@ -1,6 +1,6 @@
 # 按数据来源合并统计量
 
-`processor/aggregate_causal_action_stats.py` 只读取各子数据集的
+`processor/robocoin/aggregate_causal_action_stats.py` 只读取各子数据集的
 `meta/causal_action_stats.json`，不重新读 Parquet 或视频，不修改子数据集统计。
 依赖只有 NumPy，不依赖训练仓库、Torch 或 LeRobot 库。
 
@@ -8,10 +8,10 @@
 
 ### 按机器人前缀一键合并
 
-在 `processor/aggregate_causal_action_stats.sh` 开头的 `prefixes` 数组中选择机器人前缀，执行：
+在 `processor/robocoin/aggregate_causal_action_stats.sh` 开头的 `prefixes` 数组中选择机器人前缀，执行：
 
 ```bash
-bash processor/aggregate_causal_action_stats.sh /你的统计输出目录
+bash processor/robocoin/aggregate_causal_action_stats.sh /你的统计输出目录
 ```
 
 默认输入根目录是 `/efs-mi-east4-4/EmbodiedDatasets/openwam/RoboCOIN/RoboCOIN/`。
@@ -36,7 +36,7 @@ stats_robocoin_Galbot_g1.json
 在 data-cleaning 目录执行，把 RoboCOIN 下所有子数据集合成一份来源统计：
 
 ```bash
-python processor/aggregate_causal_action_stats.py \
+python processor/robocoin/aggregate_causal_action_stats.py \
   --dataset-root /efs-mi-east4-4/EmbodiedDatasets/openwam/RoboCOIN/RoboCOIN \
   --output /efs-mi-east4-4/EmbodiedDatasets/openwam/RoboCOIN/robocoin_causal_action_stats.json
 ```
@@ -48,7 +48,7 @@ python processor/aggregate_causal_action_stats.py \
 如果希望按机器人前缀单独合并，例如只合并 AIRBOT_MMK2：
 
 ```bash
-python processor/aggregate_causal_action_stats.py \
+python processor/robocoin/aggregate_causal_action_stats.py \
   --dataset-root /efs-mi-east4-4/EmbodiedDatasets/openwam/RoboCOIN/RoboCOIN \
   --prefix AIRBOT_MMK2 \
   --output /efs-mi-east4-4/EmbodiedDatasets/openwam/RoboCOIN/mmk2_causal_action_stats.json

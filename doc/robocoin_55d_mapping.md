@@ -4,7 +4,7 @@
 
 本文记录逐项讨论的转换规则，供后续实现和质检使用。当前确定范围为双臂关节、EEF、夹爪、灵巧手、
 腰/头/底盘不接入的规则；先完成 55D 映射，再按完整 episode 执行同事的动作策略。
-对应实现为 [processor/convert_robocoin_55d.py](../processor/convert_robocoin_55d.py)，
+对应实现为 [processor/robocoin/convert_robocoin_55d.py](../processor/robocoin/convert_robocoin_55d.py)，
 运行方式及原地追加说明见 [README](../README.md#robocoin-转-55d)。
 
 本地调试数据位于 `/mnt/sfs_turbo/public/datasets/openwam-robocoin/RoboCOIN/`。

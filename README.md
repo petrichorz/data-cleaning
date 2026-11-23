@@ -1,6 +1,82 @@
 # data-cleaning
 数据清洗
 
+处理脚本按来源放在 `processor/robocoin/` 和 `processor/interndata-a1/`。
+以下命令均在 `data-cleaning` 目录执行。
+
+## InternData-A1 转 55D
+
+入口：[processor/interndata-a1/convert_interndata_a1_55d.py](processor/interndata-a1/convert_interndata_a1_55d.py)。
+支持数据集根目录或单个任务目录，递归发现可变深度的 LeRobot v3 任务；默认任务间 4 并发。
+数据路径需手动指定：可填写 Bash 脚本顶部的 `dataset_root=""`，或通过第一个参数传入并覆盖。
+未指定路径时打印用法并退出；Python 入口同样要求显式提供路径。
+
+```bash
+python -m pip install -r processor/interndata-a1/requirements.txt
+
+# 只检查字段映射和夹爪尺度，不修改任何文件。
+python processor/interndata-a1/convert_interndata_a1_55d.py \
+  /mnt/sfs_turbo/public/datasets/openwam-interndata-a1 --dry-run
+
+# 按完整 episode 原地追加四列。
+CONVERT_JOBS=4 PYTHON_BIN=python bash processor/interndata-a1/convert_interndata_a1_55d.sh \
+  /mnt/sfs_turbo/public/datasets/openwam-interndata-a1
+
+# 可按型号或相对根目录的完整任务路径选择。
+python processor/interndata-a1/convert_interndata_a1_55d.py /path/to/InternData-A1 \
+  --robots franka --workers 2
+python processor/interndata-a1/convert_interndata_a1_55d.py /path/to/InternData-A1 \
+  --datasets articulation_tasks/franka/close_the_washingmachine_left
+```
+
+单臂/双臂由 `meta/info.json` 的 pose 字段识别；关节按元数据中的零起始编号排序，
+state/action 分别建立索引，允许各自原始排列不同。支持每侧 6 或 7 个关节，不截取超容量关节。
+
+| 55D 槽位 | 来源及处理 |
+|---|---|
+| `0:7` / `7:14` | `states/actions.left_joint.position`、`right_joint.position`；6 轴末尾补无效零 |
+| `14:21` / `21:28` | `states/actions.left_ee_to_robot_pose`、`right_ee_to_robot_pose`；xyz 原值，wxyz 四元数重排为 xyzw |
+| `28` / `29` | `states/actions.left_gripper.position`、`right_gripper.position`，除以任务对应的全开尺度 |
+| `30:55` | 本次不接入，数值和 mask 始终为 0 |
+
+Franka 单臂使用无 left/right 前缀的 `joint.position`、`ee_to_robot_pose`、`gripper.position`，
+统一放在左侧；右臂缺失是正常情况。正常单臂每帧 15 个有效分量，当前 6 轴双臂每帧 28 个有效分量。
+mask 根据来源有效性生成，真实的零仍然有效；输出四列均为 `fixed_size_list<float32>[55]`。
+
+夹爪沿用 OpenWAM：Franka 读取任务 `meta/stats.json` 中 state 夹爪最大值，
+用对数距离选择 0.08 或 1.0；Lift-2 固定 0.088，Split Aloha 固定 0.1，Genie-1 固定 5.74。
+同一任务 state/action 共用所选尺度，选择依据写入 QC；不按 episode 重新估计。
+有限越界值保留并记录，1e-6 内的浮点舍入越界不报异常。位置、关节沿用原数值和坐标定义，
+不做训练归一化、四元数符号调整或单位猜测。原 20D EEF 统计不作为 55D 训练统计使用。
+Genie-1 的字段和尺度有合成测试覆盖，当前本地没有该型号的真实任务。
+
+处理以完整 episode 为单位：按 `episode_index` 跨文件汇集，按 `frame_index` 排序，
+与 `meta/episodes/**/*.parquet` 中长度核对；缺集、缺帧、重复帧或帧号不从 0 开始时停止该任务写回。
+输入的 `actions[t]` 已是下一帧目标，逐行读取 `actions.*`，不再移动一帧，也不使用 `master_actions.*`。
+核对原值与下一帧 state 的精确关系；有限值不相等时保留源动作并记录 `next_state_mismatch`。
+每集真正末帧的派生 action 和 mask 清零；原末帧及其他原始列都保留。
+训练读取 `action_unified` 时目标偏移为 0。
+
+数值异常只屏蔽对应分量；四元数非有限、零范数或范数偏离 1 超过 1e-4 时屏蔽该侧四元数四维。
+整个必需向量缺失或宽度错误等结构异常将该行四个派生向量置零，记录后继续，不删除原行。
+
+输出沿用 RoboCOIN 的四列：`state_unified`、`action_unified`、`mask_state`、`mask_action`。
+派生列先暂存于磁盘，内存主要存一个行组和一个完整 episode。写回按 `--batch-size` 分批，
+默认 4096；临时文件刷盘关闭后再替换原文件，保持原列、schema 元数据、行数和行顺序。
+全部文件成功后仅向原 `meta/info.json` 的 features 登记四列，视频和其他元数据不改写。
+中断后直接重跑，从原始列重新计算，旧的四列会被替换。文件替换逐个提交，
+某次失败可能已有部分文件写回，以 `status` 为准；任务锁防止并发改写同一任务。
+
+每个任务的 `qc/` 保存 `conversion.log`、`conversion_errors.jsonl`、
+`episode_policy.jsonl` 和 `conversion_summary.json`；后者记录来源映射、夹爪尺度、错误计数、
+末帧屏蔽数和精确下一帧匹配数。根目录的 `qc/conversion_batch_summary.json` 汇总本轮任务。
+`complete_with_errors` 表示文件完整但有数据问题，命令仍返回 0；任一任务 `incomplete` 返回 1。
+任务内不启动多个写入进程，并行仅发生在不同任务目录之间。
+
+```bash
+python -B -m unittest discover -s processor/interndata-a1 -p 'test_*.py' -v
+```
+
 ## 转换规则文档
 
 [OpenWAM RoboCOIN → 55D 语义映射规则](doc/robocoin_55d_mapping.md)：记录双臂关节、EEF、夹爪、灵巧手映射，腰/头/底盘不接入的规则，整集动作判定与下一帧目标规则，以及后续质检项。
@@ -9,7 +85,7 @@
 
 ## RoboCOIN 转 55D
 
-脚本：[processor/convert_robocoin_55d.py](processor/convert_robocoin_55d.py)。
+脚本：[processor/robocoin/convert_robocoin_55d.py](processor/robocoin/convert_robocoin_55d.py)。
 按已确定的字段映射，新增 `state_unified`、`action_unified`、`mask_state`、`mask_action`，
 均为长度 55 的 float32 数组。先按原始行映射，再按完整 episode 沿用同事的动作策略：
 映射来源和原始同名分量（含未接入的手指）全程严格相等、语义和 mask 一致、至少 3 帧，
@@ -20,16 +96,16 @@
 在仓库根目录安装依赖并运行：
 
 ```bash
-python -m pip install -r processor/requirements.txt
+python -m pip install -r processor/robocoin/requirements.txt
 
-python processor/convert_robocoin_55d.py \
+python processor/robocoin/convert_robocoin_55d.py \
   /path/to/RoboCOIN
 ```
 
 可以只处理指定子数据集，名称需要完整匹配：
 
 ```bash
-python processor/convert_robocoin_55d.py \
+python processor/robocoin/convert_robocoin_55d.py \
   /path/to/RoboCOIN \
   --datasets AIRBOT_MMK2_mobile_car leju_robot_hotel_services_ah
 ```
@@ -75,21 +151,21 @@ float32 溢出也只屏蔽对应维度；未映射或未命名分量的 NaN/Inf 
 运行测试：
 
 ```bash
-python -B -m unittest discover -s processor -p 'test_*.py' -v
+python -B -m unittest discover -s processor/robocoin -p 'test_*.py' -v
 ```
 
 ### 按子数据集前缀并行转换
 
-启动脚本：[processor/convert_robocoin_55d.sh](processor/convert_robocoin_55d.sh)。
+启动脚本：[processor/robocoin/convert_robocoin_55d.sh](processor/robocoin/convert_robocoin_55d.sh)。
 默认根目录为 `/efs-mi-east4-4/EmbodiedDatasets/openwam/RoboCOIN/RoboCOIN/`，默认 4 并发。
 编辑脚本顶部的 `prefixes` 数组，保留本批次需要的前缀，将其他行注释掉；目前列出的 15 个前缀全部启用。
 按直接子数据集的目录名前缀匹配，区分大小写；多个前缀命中同一目录也只处理一次。
 
 ```bash
-bash processor/convert_robocoin_55d.sh
+bash processor/robocoin/convert_robocoin_55d.sh
 
 # 可选：改变并发数、Python 解释器或根目录。
-CONVERT_JOBS=8 PYTHON_BIN=/path/to/python bash processor/convert_robocoin_55d.sh /path/to/RoboCOIN
+CONVERT_JOBS=8 PYTHON_BIN=/path/to/python bash processor/robocoin/convert_robocoin_55d.sh /path/to/RoboCOIN
 ```
 
 每个进程转换一个子数据集，内部按完整 episode 处理并写回原文件；完成一个就接着取下一个。
@@ -108,24 +184,24 @@ CONVERT_JOBS=8 PYTHON_BIN=/path/to/python bash processor/convert_robocoin_55d.sh
 
 ### 只读并行检查 NaN/Inf
 
-一键启动：[processor/scan_robocoin_nonfinite.sh](processor/scan_robocoin_nonfinite.sh)。
+一键启动：[processor/robocoin/scan_robocoin_nonfinite.sh](processor/robocoin/scan_robocoin_nonfinite.sh)。
 默认扫描此前的 RoboCOIN 根目录，4 个进程并行；顶部 `prefixes` 可选择本批次前缀，默认 15 个全部启用。
 
 ```bash
-bash processor/scan_robocoin_nonfinite.sh
+bash processor/robocoin/scan_robocoin_nonfinite.sh
 
 # 可选：指定并发数、解释器、根目录，并保存异常明细和最终总计。
-SCAN_JOBS=8 PYTHON_BIN=/path/to/python bash processor/scan_robocoin_nonfinite.sh /path/to/RoboCOIN > nonfinite.jsonl
+SCAN_JOBS=8 PYTHON_BIN=/path/to/python bash processor/robocoin/scan_robocoin_nonfinite.sh /path/to/RoboCOIN > nonfinite.jsonl
 ```
 
 `BATCH_SIZE` 默认 4096；终端显示扫描进度。Bash 保留 Python 扫描器的退出码，不修改数据。
 也可以直接运行 Python：
 
 ```bash
-python processor/scan_robocoin_nonfinite.py --workers 4
+python processor/robocoin/scan_robocoin_nonfinite.py --workers 4
 
 # 可指定根目录和子数据集前缀，将结果保存为 JSONL。
-python processor/scan_robocoin_nonfinite.py /path/to/RoboCOIN \
+python processor/robocoin/scan_robocoin_nonfinite.py /path/to/RoboCOIN \
   --prefixes AIRBOT_MMK2_ G1edu-u3_ --workers 8 > nonfinite.jsonl
 ```
 
