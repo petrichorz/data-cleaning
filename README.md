@@ -77,6 +77,21 @@ Genie-1 的字段和尺度有合成测试覆盖，当前本地没有该型号的
 python -B -m unittest discover -s processor/interndata-a1 -p 'test_*.py' -v
 ```
 
+## InternData-A1 汇总训练统计
+
+先为各任务计算 `meta/causal_action_stats.json`，再按 `meta/info.json` 中的机器人型号汇总：
+
+```bash
+bash processor/interndata-a1/aggregate_interndata_a1_stats.sh \
+  /mnt/sfs_turbo/public/datasets/openwam-interndata-a1 \
+  /path/to/training_statistics
+```
+
+支持在 Bash 顶部手动填写数据根目录和输出目录；`--robots` 选择型号，`--dry-run` 只验证。
+分别输出 `stats_interndata_a1_{franka,lift2,genie1,split_aloha}.json`。
+保留实测分位数，仅将 state/action 的有效夹爪 `low/high` 固定为 `[0,1]`；
+单臂缺失的右夹爪保持无效。详见 [InternData-A1 汇总规则](doc/aggregate_interndata_a1_stats.md)。
+
 ## 转换规则文档
 
 [OpenWAM RoboCOIN → 55D 语义映射规则](doc/robocoin_55d_mapping.md)：记录双臂关节、EEF、夹爪、灵巧手映射，腰/头/底盘不接入的规则，整集动作判定与下一帧目标规则，以及后续质检项。
